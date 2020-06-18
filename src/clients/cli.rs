@@ -1,21 +1,27 @@
 use crate::core::{self, Container, Docker, Image, Logs};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::time::Instant;
 use std::{
     io::{BufRead, BufReader},
     process::{Command, Stdio},
+    sync::{Mutex, Once},
     thread::sleep,
     time::Duration,
 };
 
+lazy_static::lazy_static! {
+    static ref ALIVE_IDS: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+}
+
+static FIRST_CLI: Once = Once::new();
 const ONE_SECOND: Duration = Duration::from_secs(1);
 const ZERO: Duration = Duration::from_secs(0);
 
 /// Implementation of the Docker client API using the docker cli.
 ///
 /// This (fairly naive) implementation of the Docker client API simply creates `Command`s to the `docker` CLI. It thereby assumes that the `docker` CLI is installed and that it is in the PATH of the current execution environment.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Cli {
     /// The docker CLI has an issue that if you request logs for a container
     /// too quickly after it was started up, the resulting stream will never
@@ -44,7 +50,8 @@ impl Cli {
             start_timestamp
         );
 
-        lock_guard.insert(id, start_timestamp);
+        lock_guard.insert(id.clone(), start_timestamp);
+        let _ = ALIVE_IDS.lock().map(|mut g| g.insert(id));
     }
 
     fn time_since_container_was_started(&self, id: &str) -> Option<Duration> {
@@ -97,6 +104,25 @@ impl Cli {
             .arg(image.descriptor())
             .args(image.args())
             .stdout(Stdio::piped())
+    }
+}
+
+impl Default for Cli {
+    fn default() -> Self {
+        FIRST_CLI.call_once(|| {
+            if let Err(e) = ctrlc::set_handler(move || {
+                ALIVE_IDS
+                    .lock()
+                    .iter()
+                    .flat_map(|g| g.iter())
+                    .for_each(|e| stop(e))
+            }) {
+                log::debug!("Failed to register for ctrl-c: {}", e);
+            }
+        });
+        Self {
+            container_startup_timestamps: RwLock::default(),
+        }
     }
 }
 
@@ -169,13 +195,17 @@ impl Docker for Cli {
     }
 
     fn stop(&self, id: &str) {
-        Command::new("docker")
-            .arg("stop")
-            .arg(id)
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to execute docker command");
+        stop(id)
     }
+}
+
+fn stop(id: &str) {
+    Command::new("docker")
+        .arg("stop")
+        .arg(id)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Failed to execute docker command");
 }
 
 #[derive(serde::Deserialize, Debug)]
